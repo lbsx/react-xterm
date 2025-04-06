@@ -1,227 +1,211 @@
-import React, { memo, useEffect, useRef, useCallback } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Terminal, ITerminalOptions } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { SearchAddon } from '@xterm/addon-search';
+import io, { Socket } from 'socket.io-client';
 import '@xterm/xterm/css/xterm.css';
 
-interface TerminalComponentProps {
-  dispatch?: (action: { type: string; payload?: any; callback?: (res: any) => void }) => void;
-  onKey?: (key: string) => void;
-  props?: any;
+interface PtyOutputData {
+  output: string;
 }
 
-const defaultTerminalOptions: ITerminalOptions = {
-  scrollback: 50,
-  disableStdin: false,
-  cursorStyle: 'underline',
-  cursorBlink: true,
-  windowsMode: true,
-  fontSize: 16,
-  fontFamily: 'Courier New', // monospace
-  theme: {
-    foreground: '#ffffff',
-    background: '#1a1a1d',
-    cursor: 'help',
-  },
-};
+interface ResizeDimensions {
+  cols: number;
+  rows: number;
+}
 
-const TerminalComponent: React.FC<TerminalComponentProps> = ({ dispatch, onKey }) => {
-  const fitPlugin = useRef(new FitAddon());
-  const terminalRef = useRef<HTMLDivElement>(null);
-  const termRef = useRef<Terminal | null>(null);
-  const terminalTitleTemplate = '[root@server] $ '; // 移除 ANSI 转义序列, 在writePrompt里设置颜色
-  const historyLineData = useRef<string[]>([]);
-  const currentLineData = useRef<string>('');
-  const lastCommandIndex = useRef<number>(0);
-  const isInitialized = useRef<boolean>(false);
-  const renderCount = useRef<number>(0);
-  const isDisposed = useRef<boolean>(false);
-
-  const writePrompt = useCallback(() => {
-    if (!isDisposed.current && termRef.current) {
-      termRef.current.write('\r\n\x1B[97m' + terminalTitleTemplate + '\x1B[0m'); // 恢复默认颜色
+// Debounce function (utility)
+function debounce<T extends (...args: any[]) => void>(func: T, wait_ms: number) {
+  let timeout: NodeJS.Timeout | null = null;
+  return (...args: Parameters<T>): void => {
+    if (timeout) {
+      clearTimeout(timeout);
     }
-  }, [terminalTitleTemplate]);
+    timeout = setTimeout(() => {
+      func(...args);
+    }, wait_ms);
+  };
+}
 
-  const runJob = useCallback(
-    (param: string) => {
-      if (param && dispatch && !isDisposed.current && termRef.current) {
-        dispatch({
-          type: 'task/terminalOperation',
-          payload: { param },
-          callback: (res: any) => {
-            if (!isDisposed.current && termRef.current) {
-              termRef.current.write(`\r\n`);
-              if (res?.data?.taskListStr && Array.isArray(res.data.taskListStr)) {
-                res.data.taskListStr.forEach((t: string) => {
-                  termRef.current?.writeln(t);
-                });
-              } else if (res?.data?.errorData) {
-                termRef.current?.writeln(res.data.errorData);
-              }
-              writePrompt();
-              termRef.current.focus();
-            }
-          },
-        });
-      } else if (!isDisposed.current && termRef.current) {
-        writePrompt();
+const XtermTerminal: React.FC = () => {
+  const terminalRef = useRef<HTMLDivElement>(null);
+  const termInstance = useRef<Terminal | null>(null);
+  const fitAddonInstance = useRef<FitAddon | null>(null);
+  const socketInstance = useRef<Socket | null>(null);
+
+  const terminalOptions: ITerminalOptions = {
+    cursorBlink: true,
+    macOptionIsMeta: true,
+    scrollback: 1000, // Example scrollback
+    fontSize: 14,     // Example font size
+    fontFamily: 'monospace', // Example font family
+    theme: {          // Example theme (optional)
+      background: '#1e1e1e',
+      foreground: '#d4d4d4',
+      cursor: '#d4d4d4',
+    }
+  };
+
+  // --- Helper Functions ---
+
+  const fitToscreen = () => {
+    if (fitAddonInstance.current && termInstance.current && socketInstance.current?.connected) {
+      try {
+        fitAddonInstance.current.fit();
+        const dims: ResizeDimensions = {
+          cols: termInstance.current.cols,
+          rows: termInstance.current.rows,
+        };
+        console.log("Sending new dimensions to server's pty", dims);
+        socketInstance.current.emit("resize", dims);
+      } catch (err) {
+        console.error("Error resizing terminal:", err);
       }
-    },
-    [dispatch]
-  );
+    }
+  };
+
+  const customKeyEventHandler = (e: KeyboardEvent): boolean => {
+    if (e.type !== "keydown") {
+      return true;
+    }
+    // Use `metaKey` for Cmd on macOS, `ctrlKey` elsewhere for consistency?
+    // Or stick to Ctrl+Shift as defined.
+    if (e.ctrlKey && e.shiftKey) {
+      const key = e.key.toLowerCase();
+      if (key === "v") {
+        e.preventDefault(); // Prevent potential browser default paste action
+        navigator.clipboard.readText().then((toPaste) => {
+          termInstance.current?.write(toPaste); // Use write, not writeText for potentially complex paste
+        }).catch(err => {
+          console.error("Failed to read clipboard contents: ", err);
+        });
+        return false; // Prevent event propagation
+      } else if (key === "c" || key === "x") {
+        e.preventDefault(); // Prevent potential browser default copy/cut action
+        const term = termInstance.current;
+        if (term?.hasSelection()) {
+          const toCopy = term.getSelection();
+          navigator.clipboard.writeText(toCopy).then(() => {
+            term.focus(); // Refocus after successful copy
+            term.clearSelection(); // Optionally clear selection
+          }).catch(err => {
+            console.error("Failed to copy text to clipboard: ", err);
+          });
+        }
+        return false; // Prevent event propagation
+      }
+    }
+    return true; // Allow other keys to be processed by xterm/pty
+  };
+
+  // --- useEffect for Initialization and Cleanup ---
 
   useEffect(() => {
-    const term = new Terminal(defaultTerminalOptions);
-    termRef.current = term;
-    isDisposed.current = false;
-    let disposed = false;
+    if (!terminalRef.current) {
+      return;
+    }
 
-    term.onData(async (key) => {
-      // ... (onData 代码, 和之前一样) ...
-      if (isDisposed.current || !termRef.current) {
-        return;
-      }
+    // --- Initialize Terminal ---
+    const term = new Terminal(terminalOptions);
+    termInstance.current = term;
 
-      const term = termRef.current; // 为了简化代码
+    // --- Load Addons ---
+    const fitAddon = new FitAddon();
+    fitAddonInstance.current = fitAddon;
+    const webLinksAddon = new WebLinksAddon();
+    const searchAddon = new SearchAddon();
 
-      const writeKey = (k: string) => {
-        if (!isDisposed.current && term) {
-          term.write(k);
-        }
-      };
+    term.loadAddon(fitAddon);
+    term.loadAddon(webLinksAddon);
+    term.loadAddon(searchAddon);
 
-      const visiblePrompt = terminalTitleTemplate.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
-      const promptLength = visiblePrompt.length;
+    // --- Attach Custom Key Handler ---
+    term.attachCustomKeyEventHandler(customKeyEventHandler);
 
-      const writeBackspace = () => {
-        if (!isDisposed.current && term && term.buffer.active.cursorX > promptLength) {
-          currentLineData.current = currentLineData.current.slice(0, -1);
-          writeKey('\b \b');
-        }
-      };
+    // --- Open Terminal in DOM ---
+    term.open(terminalRef.current);
 
-      // 清除当前行的辅助函数
-      const clearCurrentLine = () => {
-        if (!isDisposed.current && term) {
-          // 将光标移动到提示符的起始位置
-          term.write('\x1b[G'); // ANSI escape code: Cursor Horizontal Absolute (CHA)
-          term.write(`\x1b[${promptLength + 1}G`);
-
-          // 清除从光标位置到行尾的内容
-          term.write('\x1b[K'); // ANSI escape code: Erase in Line (EL), K=0 (default)
-        }
-      }
-
-      // Enter key
-      if (key.charCodeAt(0) === 13) {
-        const currentCommand = currentLineData.current.trim();
-        if (currentCommand !== '') {
-          historyLineData.current.push(currentCommand);
-          lastCommandIndex.current = historyLineData.current.length;
-        }
-
-        if (currentCommand === 'clear') {
-          if (!isDisposed.current && term) {
-            term.clear();
-          }
-        }
-
-        if (dispatch) {
-          runJob(currentCommand);
-        } else {
-          writePrompt();
-        }
-
-        currentLineData.current = '';
-      } else if (key.charCodeAt(0) === 127) {
-        // Delete key
-        writeBackspace();
-      } else if (key === '\u001b[\x41') { // Up arrow
-        if (historyLineData.current.length > 0 && lastCommandIndex.current > 0) {
-          clearCurrentLine(); // 清除当前行
-          lastCommandIndex.current--;
-          currentLineData.current = historyLineData.current[lastCommandIndex.current % historyLineData.current.length] || '';
-          writeKey(currentLineData.current);
-        }
-      } else if (key === '\u001b[\x42') { // Down arrow
-        if (historyLineData.current.length > 0 && lastCommandIndex.current < historyLineData.current.length) {
-          clearCurrentLine();  // 清除当前行
-          lastCommandIndex.current++;  // 先++, 和Up Arrow保持一致
-          currentLineData.current = historyLineData.current[(lastCommandIndex.current - 1) % historyLineData.current.length] || ''; // 减1是因为先++了
-          writeKey(currentLineData.current);
+    // --- Initial Fit and Welcome Message ---
+    // Small delay to ensure layout is stable before first fit
+    setTimeout(() => {
+      // term.resize(15, 50); // This might be overridden by fit immediately
+      // console.log(`Initial size attempt: ${term.cols} columns, ${term.rows} rows`);
+      fitAddon.fit();
+      term.writeln("Welcome to xterm!");
+      term.focus(); // Focus the terminal
+    }, 50); // Adjust delay if needed
 
 
-          if (lastCommandIndex.current === historyLineData.current.length) {
-            currentLineData.current = '';
-            //if (!isDisposed.current && term) {  //这里不需要再次清除和writeKey，因为clearCurrentLine已经做了
-            //    term.write('');
-            //}
-          }
-        }
-      } else {
-        // Other characters
-        currentLineData.current += key;
-        writeKey(key);
-      }
-
-      if (onKey) {
-        onKey(key);
-      }
+    // --- Setup Terminal Data Listener ---
+    const dataListener = term.onData((data) => {
+      socketInstance.current?.emit("pty-input", { input: data });
     });
 
-    if (terminalRef.current) {
-      term.open(terminalRef.current);
-    }
+    // --- Initialize Socket.IO ---
+    const socket = io("ws://localhost:5000/pty", {
+      // Optional: Add connection options if needed
+      transports: ['websocket'], // Example: Force websocket
+    });
+    socketInstance.current = socket;
 
-    term.loadAddon(fitPlugin.current);
-    fitPlugin.current.fit();
-    window.onresize = () => fitPlugin.current.fit();
-    term.focus();
-    renderCount.current++;
+    // --- Setup Socket Event Listeners ---
+    socket.on("connect", () => {
+      // Fit after connection established and state is updated
+      // Use setTimeout to ensure DOM/layout updates related to connection status are done
+      setTimeout(fitToscreen, 0);
+    });
 
-    if (!isInitialized.current && dispatch) {
-      dispatch({
-        type: 'task/queryTask',
-        callback: (res: any) => {
-          if (!isDisposed.current && termRef.current) {
-            if (res?.data?.taskList) {
-              res.data.taskList.forEach((t: string) => {
-                termRef.current?.writeln(t);
-              });
-            }
-            isInitialized.current = true;  // 初始化完成后再设置为true
-            writePrompt(); // 确保在回调中显示
-          }
-        },
-      });
-    } else {
-      isInitialized.current = true; // 没有dispatch也设为true
-    }
-    writePrompt(); // 无论是否有dispatch, 最后都显示提示符
+    socket.on("disconnect", () => {
+      term.writeln("\r\n\x1b[31m--- disconnected ---\x1b[0m"); // Notify in terminal
+    });
 
+    socket.on("pty-output", (data: PtyOutputData | string) => {
+      // Handle both object {output: string} and raw string data
+      const output = typeof data === 'object' && data !== null && 'output' in data ? data.output : data as string;
+      // console.log("New output received from server:", output); // Can be very verbose
+      term.write(output);
+    });
+
+    socket.on("connect_error", (err) => {
+      console.error("Socket connection error:", err);
+      term.writeln(`\r\n\x1b[31m--- connection error: ${err.message} ---\x1b[0m`);
+    });
+
+
+    // --- Setup Window Resize Listener ---
+    const debouncedFit = debounce(fitToscreen, 50);
+    window.addEventListener('resize', debouncedFit);
+
+    // --- Cleanup Function ---
     return () => {
-      isDisposed.current = true;
-      if (termRef.current && !disposed) {
-        termRef.current.dispose();
-        termRef.current = null;
-        disposed = true;
-      }
+      console.log("Cleaning up terminal component...");
+      // Remove listeners
+      window.removeEventListener('resize', debouncedFit);
+      dataListener.dispose(); // Dispose xterm listeners
+      socket.off("connect");
+      socket.off("disconnect");
+      socket.off("pty-output");
+      socket.off("connect_error");
+
+      // Disconnect socket
+      socket.disconnect();
+      socketInstance.current = null;
+
+      // Dispose terminal
+      term.dispose();
+      termInstance.current = null;
+      fitAddonInstance.current = null; // Clear addon ref too
     };
-  }, [dispatch, onKey, writePrompt]);
+  }, []); // Empty dependency array ensures this runs only once on mount and cleanup on unmount
 
   return (
-    <div style={{
-       width: '100vw', height: '100vh', margin: 0,
-      padding: 0
-    }}>
-      <div style={{
-          width: '100%',  // 宽度占满父元素 (虽然通常是默认行为，但明确写出更好)
-          height: '100%', // 高度占满父元素
-          // (可选) 添加一个背景色方便调试，看它是否真的充满了
-          // backgroundColor:  "rgb(26, 26, 29)"
-        }} ref={terminalRef}></div>
-    </div>
+    <div
+      id="terminal-container"
+      ref={terminalRef}
+      style={{ height: '100%', width: '100%', backgroundColor: '#1E1E1E' }} // Example styling - adjust height/width as needed
+    ></div>
   );
 };
 
-export default memo(TerminalComponent);
+export default XtermTerminal;
